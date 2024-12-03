@@ -1,7 +1,7 @@
 [project]
 name = "samantha-os1"
 version = "0.1.0"
-description = "Samantha OS1 is a conversational AI assistant."
+description = "Samantha is a conversational AI assistant."
 readme = "README.md"
 requires-python = ">=3.12"
 

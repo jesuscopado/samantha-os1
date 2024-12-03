@@ -46,6 +46,9 @@ edit_message = true
 # Name of the assistant.
 name = "Samantha"
 
+[UI.logo] 
+path = "/public/logo_dark.png" 
+
 # Description of the assistant. This is used for HTML tags.
 # description = ""
 
