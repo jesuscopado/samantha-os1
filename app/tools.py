@@ -1,3 +1,15 @@
+from dotenv import load_dotenv
+import os
+from pathlib import Path
+import logging
+import traceback
+import pinecone
+from openai import OpenAI
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple
+import json
+from namespace_config import NamespaceConfig, NamespaceType, RegulationType
+
 """
 Derived from https://github.com/Chainlit/cookbook/tree/main/realtime-assistant
 and https://github.com/disler/poc-realtime-ai-assistant/tree/main
@@ -7,8 +19,6 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import base64
-import os
-import logging
 import webbrowser
 
 import chainlit as cl
@@ -18,15 +28,13 @@ from tavily import TavilyClient
 from together import Together
 from langchain.prompts import PromptTemplate
 from langchain_groq import ChatGroq
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-import traceback
-
-load_dotenv()
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
@@ -37,6 +45,103 @@ os.makedirs(scratch_pad_dir, exist_ok=True)
 # Initialize clients
 together_client = Together(api_key=os.environ.get("TOGETHER_API_KEY"))
 tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
+
+# Initialize OpenAI client
+openai_client = OpenAI()
+
+# Initialize Pinecone client
+try:
+    pinecone_api_key = os.environ.get("PINECONE_API_KEY")
+    pinecone_env = os.environ.get("PINECONE_ENVIRONMENT")
+    index_name = os.environ.get("PINECONE_INDEX")
+    cloud = os.environ.get('PINECONE_CLOUD', 'aws')
+    region = os.environ.get('PINECONE_REGION', 'us-east-1')
+    
+    if not all([pinecone_api_key, pinecone_env, index_name]):
+        logger.error("Missing Pinecone configuration. Required: PINECONE_API_KEY, PINECONE_ENV, PINECONE_INDEX")
+        logger.error(f"Found: API_KEY={'Yes' if pinecone_api_key else 'No'}, ENV={'Yes' if pinecone_env else 'No'}, INDEX={'Yes' if index_name else 'No'}")
+    else:
+        logger.info("Initializing Pinecone with environment: %s, index: %s, cloud: %s, region: %s", 
+                   pinecone_env, index_name, cloud, region)
+        
+        from pinecone import Pinecone, ServerlessSpec
+        
+        pc = Pinecone(api_key=pinecone_api_key)
+        spec = ServerlessSpec(cloud=cloud, region=region)
+        
+        # Initialize the index with serverless spec
+        index = pc.Index(
+            name=index_name,
+            host=f"https://{index_name}-e070002.svc.{pinecone_env}.pinecone.io",
+            spec=spec
+        )
+        logger.info("Pinecone initialization successful")
+except Exception as e:
+    logger.error(f"Failed to initialize Pinecone: {str(e)}")
+    logger.error(f"Traceback: {traceback.format_exc()}")
+
+
+# Configuration
+class Config:
+    CONFIDENCE_THRESHOLD = 0.65  # Lowered from 0.7 to allow more matches
+    FALLBACK_THRESHOLD = 0.75   # Lowered from 0.8 to allow more fallback matches
+    EMBEDDING_MODEL = "text-embedding-ada-002"
+    TOP_K_RESULTS = 4
+
+# Custom Exceptions
+class NamespaceError(Exception):
+    """Raised when there are issues with namespace detection or configuration"""
+    pass
+
+class PineconeQueryError(Exception):
+    """Raised when Pinecone queries fail"""
+    pass
+
+@dataclass
+class DocumentMetadata:
+    """Structured metadata for documents"""
+    text: str
+    source: str
+    title: str
+    regulation_type: Optional[str] = None
+    project_name: Optional[str] = None
+    document_id: Optional[str] = None
+    last_updated: Optional[str] = None
+    
+    def to_dict(self) -> dict:
+        """Convert metadata to dictionary format"""
+        return {
+            "text": self.text,
+            "source": self.source,
+            "title": self.title,
+            "regulation_type": self.regulation_type,
+            "project_name": self.project_name,
+            "document_id": self.document_id,
+            "last_updated": self.last_updated
+        }
+    
+    @staticmethod
+    def from_dict(data: dict) -> 'DocumentMetadata':
+        """Create DocumentMetadata from dictionary"""
+        return DocumentMetadata(
+            text=data.get('text', ''),
+            source=data.get('source', 'Unknown source'),
+            title=data.get('title', 'Untitled'),
+            regulation_type=data.get('regulation_type'),
+            project_name=data.get('project_name'),
+            document_id=data.get('document_id'),
+            last_updated=data.get('last_updated')
+        )
+
+def create_error_response(error_type: str, error_message: str) -> dict:
+    """Creates a standardized error response"""
+    return {
+        "error": f"{error_type} - {error_message}",
+        "confidence": 0,
+        "source": [],
+        "namespace": "general",
+        "matched_patterns": []
+    }
 
 # Define the tools
 query_stock_price_def = {
@@ -359,7 +464,6 @@ async def draft_linkedin_post_handler(topic):
 
 draft_linkedin_post = (draft_linkedin_post_def, draft_linkedin_post_handler)
 
-
 create_python_file_def = {
     "name": "create_python_file",
     "description": "Creates a Python file based on a given topic or content description.",
@@ -609,6 +713,177 @@ async def open_browser_handler(prompt: str):
 
 open_browser = (open_browser_def, open_browser_handler)
 
+retrieve_context_def = {
+    "name": "retrieve_context",
+    "description": "Retrieves relevant information from the knowledge base based on automatic namespace detection. Handles legal queries (GDPR, AI Act, Data Act), project-specific queries, and general knowledge.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The user's question"
+            }
+        },
+        "required": ["query"]
+    }
+}
+
+class NamespaceManager:
+    _instance = None
+    _config = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(NamespaceManager, cls).__new__(cls)
+            cls._config = NamespaceConfig()
+        return cls._instance
+
+    @property
+    def config(self):
+        return self._config
+
+async def process_fallback_query(query_embedding, fallback_namespace="general"):
+    """Process fallback query when primary namespace search fails"""
+    try:
+        logger.info(f"Executing fallback query in namespace: {fallback_namespace}")
+        
+        fallback_response = index.query(
+            vector=query_embedding,
+            top_k=Config.TOP_K_RESULTS,
+            include_metadata=True,
+            namespace=fallback_namespace
+        )
+        logger.info(f"Found {len(fallback_response.matches)} fallback matches")
+        
+        contexts = []
+        for match in fallback_response.matches:
+            logger.info(f"Processing fallback match with score: {match.score}")
+            if match.score >= Config.FALLBACK_THRESHOLD:
+                if match.metadata:
+                    try:
+                        metadata = DocumentMetadata(
+                            text=match.metadata.get('text', ''),
+                            source=match.metadata.get('source', 'Unknown source'),
+                            title=match.metadata.get('title', 'Untitled'),
+                            regulation_type=None,  # No regulation type in fallback
+                            project_name=None,     # No project name in fallback
+                            document_id=match.metadata.get('document_id')
+                        )
+                        contexts.append(metadata)
+                        logger.info(f"Added fallback context from source: {metadata.source}")
+                    except Exception as e:
+                        logger.warning(f"Error processing fallback metadata: {str(e)}")
+                        continue
+            else:
+                logger.debug(f"Skipping fallback match with low score: {match.score}")
+        
+        if not contexts:
+            logger.info(f"No high-confidence matches found in fallback namespace: {fallback_namespace}")
+        
+        return contexts
+        
+    except Exception as e:
+        logger.error(f"Fallback query failed in namespace {fallback_namespace}: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return None
+
+async def retrieve_context_handler(query: str):
+    """Handle context retrieval with proper namespace detection and error handling"""
+    try:
+        logger.info(f"Processing query: {query}")
+        
+        # Use NamespaceManager singleton instead of direct instantiation
+        ns_manager = NamespaceManager()
+        namespace_match = ns_manager.config.detect_namespace(query)
+        logger.info(f"Detected namespace: {namespace_match.namespace}")
+        logger.info(f"Namespace value: {namespace_match.namespace.value}")
+        logger.info(f"Confidence: {namespace_match.confidence}")
+        if namespace_match.regulation_type:
+            logger.info(f"Regulation type: {namespace_match.regulation_type}")
+        if namespace_match.project_name:
+            logger.info(f"Project name: {namespace_match.project_name}")
+        
+        # Get embedding using config model
+        embed_response = openai_client.embeddings.create(
+            model=Config.EMBEDDING_MODEL,
+            input=query
+        )
+        query_embedding = embed_response.data[0].embedding
+        
+        # Determine namespace for Pinecone query - only use base namespaces
+        base_namespace = namespace_match.namespace.value if namespace_match.namespace else "general"
+        pinecone_namespace = base_namespace  # Always use base namespace
+            
+        logger.info(f"Using Pinecone namespace: {pinecone_namespace}")
+        
+        try:
+            logger.info("Querying Pinecone...")
+            query_response = index.query(
+                vector=query_embedding,
+                top_k=Config.TOP_K_RESULTS,
+                include_metadata=True,
+                namespace=pinecone_namespace
+            )
+            logger.info(f"Found {len(query_response.matches)} matches")
+        except Exception as e:
+            raise PineconeQueryError(f"Failed to query Pinecone: {str(e)}")
+        
+        contexts = []
+        for match in query_response.matches:
+            logger.info(f"Processing match with score: {match.score}")
+            if match.score >= Config.CONFIDENCE_THRESHOLD:
+                if match.metadata:
+                    try:
+                        metadata = DocumentMetadata(
+                            text=match.metadata.get('text', ''),
+                            source=match.metadata.get('source', 'Unknown source'),
+                            title=match.metadata.get('title', 'Untitled'),
+                            regulation_type=namespace_match.regulation_type.value if namespace_match.regulation_type else None,
+                            project_name=namespace_match.project_name,
+                            document_id=match.metadata.get('document_id')
+                        )
+                        contexts.append(metadata)
+                        logger.info(f"Added context from source: {metadata.source}")
+                    except Exception as e:
+                        logger.warning(f"Error processing metadata: {str(e)}")
+                        continue
+        
+        # If no high-confidence matches found, try general namespace fallback
+        if not contexts and pinecone_namespace != "general":
+            logger.info("No high-confidence matches found, trying general fallback...")
+            try:
+                logger.info("Trying general namespace fallback")
+                general_contexts = await process_fallback_query(query_embedding, fallback_namespace="general")
+                if general_contexts:
+                    contexts.extend(general_contexts)
+                    logger.info(f"Added {len(general_contexts)} fallback contexts from general namespace")
+            except Exception as e:
+                logger.warning(f"Fallback processing failed: {str(e)}")
+        
+        # Convert DocumentMetadata objects to dictionaries for JSON serialization
+        context_dicts = [ctx.to_dict() for ctx in contexts]
+        
+        result = {
+            "contexts": context_dicts,
+            "confidence": max((match.score for match in query_response.matches), default=0),
+            "source": [ctx["source"] for ctx in context_dicts],
+            "namespace": pinecone_namespace,
+            "matched_patterns": namespace_match.matched_patterns if namespace_match else [],
+            "regulation_type": namespace_match.regulation_type.value if namespace_match.regulation_type else None
+        }
+        
+        logger.info(f"Final result: {json.dumps(result, default=str)}")
+        return result
+        
+    except NamespaceError as e:
+        logger.error(f"Namespace error: {str(e)}")
+        return create_error_response("Namespace error occurred", str(e))
+    except PineconeQueryError as e:
+        logger.error(f"Pinecone query error: {str(e)}")
+        return create_error_response("Pinecone query error occurred", str(e))
+
+retrieve_context = (retrieve_context_def, retrieve_context_handler)
+
 tools = [
     query_stock_price,
     draw_plotly_chart,
@@ -618,4 +893,5 @@ tools = [
     create_python_file,
     execute_python_file,
     open_browser,
+    retrieve_context,  # Add our new tool
 ]

@@ -1,0 +1,13 @@
+chainlit
+fastapi
+uvicorn[standard]
+websockets
+numpy
+yfinance
+plotly
+pydantic
+python-dotenv
+tavily
+together-ai
+langchain
+langchain-groq

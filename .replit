@@ -1,0 +1,19 @@
+run = "uvicorn app.samantha:app --host 0.0.0.0 --port 8000"
+language = "python3"
+entrypoint = "app/samantha.py"
+
+[nix]
+channel = "stable-22_11"
+
+[env]
+PYTHONPATH = "${PYTHONPATH}:${workspaceFolder}"
+PYTHONUNBUFFERED = "1"
+
+[languages]
+python = "3.11"
+
+[languages.python]
+pattern = "**/*.py"
+
+[languages.python.languageServer]
+start = "pylsp"

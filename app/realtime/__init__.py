@@ -123,29 +123,30 @@ class RealtimeAPI(RealtimeEventHandler):
         if self.is_connected():
             raise Exception("Already connected")
 
-        if self.use_azure:
-            if not self.url:
-                raise ValueError("Azure OpenAI URL is required")
-
-            url = f"wss://{self.url}/openai/realtime?api-version={self.api_version}&deployment={self.deployment}"
-            # logger.info(f"Connecting to Azure URL: {url}")
-            self.ws = await websockets.connect(
-                url,
-                extra_headers={
-                    "api-key": self.api_key,
-                    "User-Agent": self.user_agent,
-                    "x-ms-client-request-id": str(self.request_id),
-                },
-            )
-        else:
-            # logger.info(f"Connecting to OpenAI URL: {self.url}")
+        try:
             self.ws = await websockets.connect(
                 f"{self.url}?model={model}",
                 extra_headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "OpenAI-Beta": "realtime=v1",
-                },
+                }
             )
+            
+            # Stuur initieel bericht na verbinding
+            initial_message = {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["text"],
+                    "instructions": "Please assist the user.",
+                }
+            }
+            await self.ws.send(json.dumps(initial_message))
+            
+            logger.info("Connected and sent initial message")
+            
+        except Exception as e:
+            logger.error(f"Connection error: {str(e)}")
+            raise
 
         self.log(f"Connected to {self.url}")
         asyncio.create_task(self._receive_messages())
@@ -336,12 +337,20 @@ class RealtimeConversation:
     def _process_speech_stopped(self, event, input_audio_buffer):
         item_id = event["item_id"]
         audio_end_ms = event["audio_end_ms"]
+        
+        # Check if speech item exists, if not create it
+        if item_id not in self.queued_speech_items:
+            logger.warning(f"Speech item {item_id} not found in queued_speech_items, creating it")
+            self.queued_speech_items[item_id] = {"audio_start_ms": 0}  # Default to start of audio
+            
         speech = self.queued_speech_items[item_id]
         speech["audio_end_ms"] = audio_end_ms
+        
         if input_audio_buffer:
-            start_index = (speech["audio_start_ms"] * self.default_frequency) // 1000
+            start_index = (speech.get("audio_start_ms", 0) * self.default_frequency) // 1000
             end_index = (speech["audio_end_ms"] * self.default_frequency) // 1000
             speech["audio"] = input_audio_buffer[start_index:end_index]
+        
         return None, None
 
     def _process_response_created(self, event):
