@@ -91,25 +91,12 @@ class RealtimeAPI(RealtimeEventHandler):
         self,
         url=None,
         api_key=None,
-        api_version="2024-10-01-preview",
-        deployment=None,
+        model="gpt-4o-realtime-preview-2024-10-01",
     ):
         super().__init__()
-        self.use_azure = os.getenv("USE_AZURE", "false").lower() == "true"
-
-        if self.use_azure:
-            self.url = url or os.getenv("AZURE_OPENAI_URL")
-            self.api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
-            self.api_version = api_version
-            self.deployment = deployment or os.getenv(
-                "OPENAI_DEPLOYMENT_NAME_REALTIME", "gpt-4o-realtime-preview"
-            )
-            self.user_agent = "ms-rtclient-0.4.3"
-            self.request_id = uuid.uuid4()
-        else:
-            self.default_url = "wss://api.openai.com/v1/realtime"
-            self.url = url or self.default_url
-            self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.url = url or os.getenv("OPENAI_API_BASE")
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.model = model
 
         self.ws = None
 
@@ -119,45 +106,35 @@ class RealtimeAPI(RealtimeEventHandler):
     def log(self, *args):
         logger.debug(f"[Websocket/{datetime.utcnow().isoformat()}]", *args)
 
-    async def connect(self, model="gpt-4o-realtime-preview-2024-10-01"):
+    async def connect(self):
         if self.is_connected():
             raise Exception("Already connected")
 
-        if self.use_azure:
-            if not self.url:
-                raise ValueError("Azure OpenAI URL is required")
+        url = f"wss://{self.url}/realtime?model={self.model}"
 
-            url = f"wss://{self.url}/openai/realtime?api-version={self.api_version}&deployment={self.deployment}"
-            # logger.info(f"Connecting to Azure URL: {url}")
-            self.ws = await websockets.connect(
-                url,
-                extra_headers={
-                    "api-key": self.api_key,
-                    "User-Agent": self.user_agent,
-                    "x-ms-client-request-id": str(self.request_id),
-                },
-            )
-        else:
-            # logger.info(f"Connecting to OpenAI URL: {self.url}")
-            self.ws = await websockets.connect(
-                f"{self.url}?model={model}",
-                extra_headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "OpenAI-Beta": "realtime=v1",
-                },
-            )
+        self.ws = await websockets.connect(
+            url,
+            extra_headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "OpenAI-Beta": "realtime=v1",
+            },
+        )
 
         self.log(f"Connected to {self.url}")
         asyncio.create_task(self._receive_messages())
 
     async def _receive_messages(self):
-        async for message in self.ws:
-            event = json.loads(message)
-            if event["type"] == "error":
-                logger.error("ERROR", event)
-            self.log("received:", event)
-            self.dispatch(f"server.{event['type']}", event)
-            self.dispatch("server.*", event)
+        try:
+            async for message in self.ws:
+                event = json.loads(message)
+                if event["type"] == "error":
+                    logger.error("ERROR", event)
+                self.log("received:", event)
+                self.dispatch(f"server.{event['type']}", event)
+                self.dispatch("server.*", event)
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.error(f"WebSocket connection closed: {e}")
+            self.ws = None
 
     async def send(self, event_name, data=None):
         if not self.is_connected():
@@ -436,7 +413,7 @@ class RealtimeClient(RealtimeEventHandler):
         super().__init__()
         self.default_session_config = {
             "modalities": ["text", "audio"],
-            "instructions": "System settings:\nTool use: enabled.\n\nInstructions:\n- You are an artificial intelligence agent called Samantha responsible for helping test realtime voice capabilities\n- Please make sure to respond with a helpful voice via audio\n- Be kind, helpful, and curteous\n- It is okay to ask the user questions\n- Use tools and functions you have available liberally, it is part of the training apparatus\n- Be open to exploration and conversation\n- Remember: this is just for fun and testing!\n\nPersonality:\n- Be upbeat and genuine\n- Try speaking quickly as if excited\n",
+            "instructions": "System settings:\nTool use: enabled.\n\nInstructions:\n- You are an artificial intelligence agent called Samantha responsible for helping test realtime voice capabilities\n- Please make sure to respond with a helpful voice via audio\n- Be kind, helpful, and courteous\n- It is okay to ask the user questions\n- Use tools and functions you have available liberally, it is part of the training apparatus\n- Be open to exploration and conversation\n- Remember: this is just for fun and testing!\n\nPersonality:\n- Be upbeat and genuine\n- Try speaking quickly as if excited\n",
             "voice": "shimmer",
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
@@ -553,7 +530,7 @@ class RealtimeClient(RealtimeEventHandler):
                 },
             )
         except Exception as e:
-            logger.error(f"Tool call error: {json.dumps({"error": str(e)})}")
+            logger.error(f"Tool call error: {json.dumps({'error': str(e)})}")
             await self.realtime.send(
                 "conversation.item.create",
                 {
@@ -615,7 +592,7 @@ class RealtimeClient(RealtimeEventHandler):
 
     def remove_tool(self, name):
         if name not in self.tools:
-            raise Exception(f'Tool "{name}" does not exist, can not be removed.')
+            raise Exception(f'Tool "{name}" does not exist, cannot be removed.')
         del self.tools[name]
         return True
 
